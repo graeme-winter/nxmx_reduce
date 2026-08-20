@@ -132,8 +132,11 @@ needed, no recompression cost.
 8. **`--crop` cuts out the central detector area and *decodes* every frame — it
    is the one operation that cannot use the verbatim chunk copy.** A crop takes
    a sub-window of each frame, which is not a whole chunk, so the compressed
-   bytes cannot be reused; frames are decoded, sliced, and recompressed
-   (gzip+shuffle). Things that bit us / to keep:
+   bytes cannot be reused; frames are decoded, sliced, and recompressed with
+   the native Eiger pipeline (bitshuffle+LZ4 via `hdf5plugin` —
+   `_crop_compression`; falls back to gzip+shuffle only if the plugin is
+   somehow absent, but `--crop` already requires it to decode). Things that bit
+   us / to keep:
      - **The module geometry is a hard-coded lookup over two Eiger families,
        keyed by image shape.** An Eiger image is a grid of modules separated by
        fixed gaps, and there are two geometries in the wild — told apart

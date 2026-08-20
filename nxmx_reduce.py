@@ -782,6 +782,19 @@ class Reducer:
             return tuple(self.crop_shape)
         return tuple(src.shape[1:])
 
+    def _crop_compression(self) -> dict:
+        """``create_dataset`` compression kwargs for recompressed cropped data.
+
+        A crop decodes each frame and recompresses it, so we re-emit the native
+        Eiger pipeline -- bitshuffle + LZ4 (bslz4) -- rather than gzip+shuffle.
+        ``--crop`` already requires ``hdf5plugin`` to decode the source (see
+        ``_require_decodable``), so the filter is present; fall back to
+        gzip+shuffle only in the unexpected case that it is not."""
+        if _HAVE_HDF5PLUGIN:
+            return dict(hdf5plugin.Bitshuffle(cname="lz4"))
+        return dict(shuffle=True, compression="gzip",
+                    compression_opts=self.args.compression_level)
+
     def _require_decodable(self):
         """--crop must decode frames; make sure every image filter is present.
 
@@ -1200,16 +1213,14 @@ class Reducer:
     # -- crop (--crop) -------------------------------------------------
     def _copy_stack_cropped(self, name, src, dgrp, keep):
         """Copy the leading `keep` frames of an image stack, cropped to the
-        central window.  Frames are decoded and recompressed (gzip+shuffle) --
-        a sub-window of a frame is not a whole chunk, so the verbatim copy path
-        cannot be used here."""
+        central window.  Frames are decoded and recompressed (bitshuffle+LZ4,
+        the native Eiger pipeline) -- a sub-window of a frame is not a whole
+        chunk, so the verbatim copy path cannot be used here."""
         keep = max(0, min(keep, src.shape[0] if src.ndim else 0))
         shape = (keep,) + tuple(self.crop_shape)
-        level = self.args.compression_level
         chunks = (1,) + tuple(self.crop_shape)
         dst = dgrp.create_dataset(name, shape=shape, dtype=src.dtype,
-                                  chunks=chunks, shuffle=True,
-                                  compression="gzip", compression_opts=level)
+                                  chunks=chunks, **self._crop_compression())
         sy0, sy1, sx0, sx1 = self.crop
         for i in range(keep):
             dst[i] = src[i, sy0:sy1, sx0:sx1]
@@ -1228,9 +1239,8 @@ class Reducer:
                   file=sys.stderr)
             self.copy_plain(name, src, dgrp, _no_crop=True)
             return
-        level = self.args.compression_level
-        dst = dgrp.create_dataset(name, data=data, chunks=True, shuffle=True,
-                                  compression="gzip", compression_opts=level)
+        dst = dgrp.create_dataset(name, data=data, chunks=True,
+                                  **self._crop_compression())
         copy_attrs(src, dst)
         self.fixup(name, src, dst, dgrp)
         if self.args.verbose:

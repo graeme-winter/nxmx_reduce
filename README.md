@@ -34,14 +34,20 @@ data files of at most `N` frames each (instead of mirroring the source's
 partitioning), rebuilding the virtual data set and the `data_00000i` links to
 match. See [Repartitioning](#repartitioning-the-data-files) below.
 
+Optionally, `--crop` **cuts out the central area of an Eiger detector**
+(16M→4M, 9M→1M by default) and rewrites the geometry header — image size, beam
+centre and detector origin — so the smaller detector reads back correctly. See
+[Cropping the detector](#cropping-the-detector) below.
+
 ## Requirements
 
 - Python 3.9+
 - [`h5py`](https://www.h5py.org/) and `numpy`
-- [`hdf5plugin`](https://pypi.org/project/hdf5plugin/) — **optional**. Only
-  needed for `--verify` (which reads frames back and therefore has to
-  decompress them). The reduction itself copies compressed chunks without
-  decoding, so it does not need the plugin.
+- [`hdf5plugin`](https://pypi.org/project/hdf5plugin/) — **optional**. Needed
+  for `--verify` (which reads frames back and therefore has to decompress them)
+  and for `--crop` (which decodes every frame to cut out the sub-window). The
+  plain reduction copies compressed chunks without decoding, so it does not
+  need the plugin.
 
 ## Installation
 
@@ -96,6 +102,8 @@ dials.import small/ins10_1.nxs
 | `-n, --num-images N` | **(required)** number of images to keep, from the start of the scan |
 | `-o, --output DIR` | output directory (default: `./reduced`) |
 | `--frames-per-data N` | repartition the kept images into data files of at most `N` frames each, rebuilding the VDS and `data_00000i` links (DECTRIS self-referencing-VDS layout) |
+| `--crop` | crop the central detector area to a smaller Eiger class (16M→4M, 9M→1M), adjusting the header; decodes frames, so needs `hdf5plugin` |
+| `--crop-to CLASS` | crop to a specific class instead of the default (`500K`, `1M`, `4M`, `9M`, `16M`); implies `--crop` |
 | `--verify` | after writing, read every retained frame back and compare it with the original (needs a compression filter plugin, i.e. `hdf5plugin`) |
 | `-l, --compression-level 0–9` | gzip level for recompressed masks (default: 4) |
 | `--also-compress GLOB` | also gzip an extra data set by name, e.g. `--also-compress flatfield` (repeatable) |
@@ -146,6 +154,46 @@ they are stitched seamlessly.
 It currently supports the DECTRIS self-referencing-VDS-over-external-link
 layout (the usual NE-CAT Eiger2 shape). Other layouts are rejected with a clear
 message; omit the flag to reduce them with their partitioning preserved.
+
+## Cropping the detector
+
+`--crop` cuts out the central rectangle of an Eiger detector, keeping a whole
+number of the inner modules and discarding the outer ones (and their gaps):
+
+```
+nxmx-reduce -n 20 --crop ins10_1.nxs -o small --verify
+```
+
+By default the target class is chosen from the source: a **16M → 4M** and a
+**9M → 1M**. Force another target with `--crop-to`:
+
+```
+nxmx-reduce -n 20 --crop-to 1M ins10_1.nxs -o small --verify
+```
+
+An Eiger image is a grid of identical `1028×512` px modules separated by fixed
+`12`/`38` px gaps; the crop always starts and ends on a module boundary, so it
+only ever removes whole outer modules — no module is split. The header is
+rewritten to match so the copy is geometrically correct in DIALS and other
+NXmx readers:
+
+- the image size (`x/y_pixels_in_detector`, `module/data_size`);
+- the beam centre (`beam_center_x/y`), shifted by the pixels removed from the
+  top-left corner;
+- the detector origin (`module/module_offset`), moved along the fast/slow pixel
+  directions so the module still sits at the right place in the lab frame. The
+  physical beam position is invariant under the crop — DIALS derives the beam
+  centre from `module_offset` and gets exactly the written `beam_center_*`.
+
+Detector-sized 2-D maps (masks, flatfields) are cropped to the same window;
+per-image 1-D arrays (omega, timestamps, …) are untouched.
+
+Unlike the plain reduction, cropping takes a sub-window of each frame — which
+is not a whole compressed chunk — so frames are **decoded, sliced and
+recompressed** (gzip+shuffle) rather than copied verbatim. That means a filter
+plugin (`hdf5plugin`) must be installed, and it is slower than a plain reduce.
+`--crop` cannot be combined with `--frames-per-data`. `--verify` compares each
+output frame with the correspondingly-cropped source frame.
 
 ## Notes and caveats
 

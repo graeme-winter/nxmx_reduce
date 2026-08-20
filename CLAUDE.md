@@ -8,6 +8,10 @@ Written for NE-CAT (APS 24-ID-C / 24-ID-E) Eiger2 data.
 data files of at most `N` frames each and rebuilds the virtual data set (and
 the `data_00000i` links) to match — see item 7 below.
 
+`--crop` cuts out the central area of an Eiger detector (16M→4M, 9M→1M by
+default; `--crop-to CLASS` forces another target) and rewrites the geometry
+header to match — see item 8 below.
+
 ## Layout
 
     nxmx_reduce.py    the tool
@@ -125,6 +129,42 @@ needed, no recompression cost.
        (item 2). `verify` skips absorbed sources and relies on the master-stack
        readback (which decodes through the rebuilt VDS → links → new files).
 
+8. **`--crop` cuts out the central detector area and *decodes* every frame — it
+   is the one operation that cannot use the verbatim chunk copy.** A crop takes
+   a sub-window of each frame, which is not a whole chunk, so the compressed
+   bytes cannot be reused; frames are decoded, sliced, and recompressed
+   (gzip+shuffle). Things that bit us / to keep:
+     - **The module geometry is a hard-coded lookup, verified against real
+       data.** An Eiger image is a grid of `1028×512` (fast×slow) modules with
+       `12 px` (fast) / `38 px` (slow) inter-module gaps — these constants were
+       read off the gap pixels of a real Diamond I04 Eiger 16M, *not* the
+       nominal `1030×514`/`10`/`37` you'll find quoted; the data array uses
+       these. `identify_eiger` matches the `(slow, fast)` shape to a class
+       (16M=4×8, 9M=3×6, 4M=2×4, 1M=1×2, 500K=1×1) and `plan_crop` keeps the
+       centred block of whole modules, so the window always starts/ends on a
+       module boundary and only discards whole outer modules and their gaps.
+     - **The crop is only valid if the header moves with it.** Three things
+       change and DIALS reads all of them: image size (`x/y_pixels_in_detector`,
+       `module/data_size` — which is `[slow, fast]`), the beam centre
+       (`beam_center_x -= sx0`, `beam_center_y -= sy0`), and the detector origin
+       (`module/module_offset`). The last is the one that matters for
+       geometry: the module origin is displaced along the `fast/slow_pixel_
+       direction` vectors by `(sx0, sy0)` pixels, then re-decomposed into
+       magnitude+unit-vector. Cross-check: DIALS derives the beam centre purely
+       from the `module_offset` chain and it must equal the written
+       `beam_center_*` — the physical beam position is invariant under the crop
+       (origin shift and beam-centre shift cancel). `data_origin` stays `[0,0]`.
+     - **Preflight must NOT run when cropping** (it may unregister the filter
+       for verbatim copy — item 6); crop needs the filter *present* to decode,
+       so `_require_decodable` fails fast if a plugin is missing.
+     - **Detector-sized 2D maps (masks, flatfields) are cropped too**, matched
+       by trailing shape `== plan.image_shape`. Per-image 1D arrays (omega, …)
+       are untouched.
+     - Mutually exclusive with `--frames-per-data` (that path copies chunks
+       verbatim; crop decodes) — combining them errors.
+     - `--verify` *does* catch a bad crop: it compares each output frame with
+       the correspondingly-cropped source frame (`_src_frame`).
+
 ## Testing
 
     python nxmx_reduce.py -n 12 eiger/lyso_1_master.h5 -o out --verify -v
@@ -139,6 +179,12 @@ straddles a source boundary:
 After repartitioning, *check the written filenames* (`ins10_1_00000i.h5`) and
 the regenerated `data_00000i` links — `--verify` alone will not catch a naming
 bug.
+
+Crop (item 8) — `--verify` compares each frame with the cropped source; also
+sanity-check the header:
+
+    python nxmx_reduce.py -n 20 --crop ins10_1.nxs -o out --verify   # 16M -> 4M
+    python nxmx_reduce.py -n 20 --crop-to 1M ins10_1.nxs -o out --verify
 
 Cross-version check (catches item 2) — build a venv with an older HDF5 and
 read the output back:
@@ -167,6 +213,14 @@ geometry is identical to the original and `dials.find_spots` gives 1046 ==
 1046 reflections vs `image_range=1,20` on the original; a block that crosses a
 source boundary (`-n 1500 --frames-per-data 400`) is byte-identical at the seam
 (src1[999]==file3[199], src2[0]==file3[200]).
+
+`--crop` verified end-to-end on `ins10_1.nxs` (Eiger 16M → 4M, `-n 20`):
+`dials.import` reads the cropped panel as `2068×2162` px with beam centre
+`(1081.07, 1121.33)` derived from the rewritten `module_offset` — exactly the
+written `beam_center_*`. `dials.find_spots` finds 979 spots; the uncropped
+20-frame reference finds 1046, of which exactly 979 lie inside the crop window,
+and all 979 match the cropped spots within 1 px on the same frame (979/979).
+The 67 spots on the discarded outer modules are correctly gone.
 
 ## Not yet verified
 

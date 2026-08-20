@@ -37,6 +37,9 @@ Examples
 
     # keep 5 images, also recompress the flatfield, be chatty
     nxmx_reduce.py -n 5 master.nxs -o small --also-compress flatfield -v
+
+    # keep 5 images and drop the flatfield correction entirely
+    nxmx_reduce.py -n 5 master.nxs -o small --drop flatfield
 """
 
 from __future__ import annotations
@@ -467,12 +470,14 @@ class Reducer:
         self.nout = min(args.num_images, self.nin) if args.num_images else self.nin
         self.plan.apply(self.nout)
         self.mask_patterns = list(DEFAULT_MASK_NAMES) + list(args.also_compress)
+        self.drop_patterns = list(args.drop)
         self.libver = ("earliest", args.libver)
         self.pipelines = PipelineResolver(args.verbose)
         self.outnames: dict[str, str] = {}     # resolved src path -> out name
         self.queue: list[Path] = []
         self.done: set[str] = set()
-        self.stats = {"masks": 0, "trimmed": 0, "frames": 0, "files": 0}
+        self.stats = {"masks": 0, "trimmed": 0, "frames": 0, "files": 0,
+                      "dropped": 0}
         # filters we unregistered so their chunks copy verbatim (see
         # _preflight_pipelines); re-registered before --verify
         self.verbatim_filters: set[int] = set()
@@ -502,6 +507,9 @@ class Reducer:
         if dset.ndim < 2 or dset.dtype.kind not in "uifb":
             return False
         return any(fnmatch.fnmatch(name, pat) for pat in self.mask_patterns)
+
+    def is_dropped(self, name: str) -> bool:
+        return any(fnmatch.fnmatch(name, pat) for pat in self.drop_patterns)
 
     def is_per_image(self, dset: h5py.Dataset) -> bool:
         if not dset.ndim or dset.shape[0] != self.nin or self.nin < 2:
@@ -665,6 +673,16 @@ class Reducer:
         if entry is not None:
             self.copy_frames(name, src, dgrp, entry.keep, label="images")
             self.stats["frames"] += entry.keep
+            return
+
+        if self.is_dropped(name):
+            if self.args.verbose:
+                try:
+                    size = human(src.nbytes)
+                except Exception:
+                    size = "?"
+                print(f"  - dropping {src.name} {src.shape} ({size})")
+            self.stats["dropped"] += 1
             return
 
         if self.is_mask(name, src):
@@ -931,6 +949,8 @@ class Reducer:
         print(f"files     : {len(src_files)} in data set, "
               f"{self.stats['files']} written")
         print(f"masks     : {self.stats['masks']} recompressed")
+        if self.stats["dropped"]:
+            print(f"dropped   : {self.stats['dropped']} data set(s) removed")
         print(f"per-image : {self.stats['trimmed']} data set(s) truncated")
         print(f"size      : {human(before)} -> {human(after)}"
               + (f"  ({before / after:.1f}x smaller)" if after else ""))
@@ -959,6 +979,11 @@ def main(argv=None):
                    metavar="GLOB",
                    help="additional data set names to gzip, e.g. 'flatfield' "
                         "(repeatable)")
+    p.add_argument("--drop", action="append", default=[], metavar="GLOB",
+                   help="data set names to omit from the output entirely, "
+                        "e.g. 'flatfield' to drop the flat-field correction "
+                        "(matched on the base name; image stacks are never "
+                        "dropped; repeatable)")
     p.add_argument("--libver", default="v110",
                    choices=("v108", "v110", "v112", "v114", "latest"),
                    help="upper HDF5 format bound for the output (default: "

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nxmx-reduce"
+description = "Shrink an NXmx data set: truncate the image stack and every per-image data set, recompress masks."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "Graeme Winter", email = "gw363@cornell.edu" },
+]
+keywords = ["NXmx", "HDF5", "Eiger", "crystallography", "diffraction", "DIALS"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dynamic = ["version"]
+dependencies = [
+    "h5py",
+    "numpy",
+]
+
+[project.optional-dependencies]
+# Lets the tool read bitshuffle/LZ4 data and re-register filters for --verify.
+plugins = ["hdf5plugin"]
+
+[project.scripts]
+nxmx-reduce = "nxmx_reduce:main"
+
+[project.urls]
+Homepage = "https://github.com/graeme-winter/nxmx_reduce"
+
+[tool.setuptools]
+py-modules = ["nxmx_reduce"]
+
+[tool.setuptools.dynamic]
+version = { attr = "nxmx_reduce.__version__" }

@@ -38,23 +38,41 @@ Given a master file and `-n N`, it writes into an output directory:
   decompress them). The reduction itself copies compressed chunks without
   decoding, so it does not need the plugin.
 
+## Installation
+
 ```
-pip install h5py numpy hdf5plugin
+pip install nxmx-reduce
 ```
 
-No build step; it is a single file.
+This installs the `nxmx-reduce` command and pulls in `h5py` and `numpy`. To
+also get `hdf5plugin` (needed only for `--verify`):
+
+```
+pip install "nxmx-reduce[plugins]"
+```
+
+To install from a checkout:
+
+```
+pip install .
+```
+
+It is still a single-file module — you can also just run `nxmx_reduce.py`
+directly without installing, provided `h5py` and `numpy` are available.
 
 ## Usage
 
 ```
-python nxmx_reduce.py -n N MASTER [-o OUTDIR] [--verify] [-v]
+nxmx-reduce -n N MASTER [-o OUTDIR] [--verify] [-v]
 ```
+
+(or, without installing, `python nxmx_reduce.py -n N MASTER …`)
 
 Keep the first 600 images of `ins10_1.nxs`, writing to `./small`, and read the
 frames back to check them:
 
 ```
-python nxmx_reduce.py -n 600 ins10_1.nxs -o small --verify -v
+nxmx-reduce -n 600 ins10_1.nxs -o small --verify -v
 ```
 
 The master may be named `*_master.h5`, `*.nxs`, or anything else — pass
@@ -117,17 +135,3 @@ essentially fixed, so the reduction is roughly proportional to `N / total`.
   copied verbatim; the filter is just stored as *optional* rather than
   *mandatory*. This is invisible to any reader that has the plugin installed
   (all normal readers do).
-
-## Testing
-
-```
-python make_eiger.py eiger                                  # synthetic data set
-python nxmx_reduce.py -n 12 eiger/lyso_1_master.h5 -o out --verify -v
-python test_filters.py                                      # every installable HDF5 filter (needs hdf5plugin)
-./test_dials.sh <real_master.h5> [nimages]                  # end-to-end DIALS check on real data
-```
-
-`test_dials.sh` reduces a real data set, then confirms that `dials.import`
-geometry and `dials.find_spots` counts match `dials.import image_range=1,N` on
-the original — i.e. the reduced copy is indistinguishable from the original
-over the frames it keeps.

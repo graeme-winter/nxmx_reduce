@@ -7,9 +7,7 @@ Written for NE-CAT (APS 24-ID-C / 24-ID-E) Eiger2 data.
 ## Layout
 
     nxmx_reduce.py    the tool
-    make_eiger.py     synthetic Eiger2-style NXmx generator (bslz4, VDS, 5 data files)
-    test_filters.py   round-trips the tool against every installable HDF5 filter
-    test_dials.sh     end-to-end check with real DIALS (run this on real data)
+    pyproject.toml    packaging metadata (installs the `nxmx-reduce` command)
 
 ## What it does
 
@@ -89,16 +87,12 @@ needed, no recompression cost.
        mask or `--also-compress` target ever used the same plugin filter,
        its decode would break — re-register around it if that ever happens.
      - `--verify` decodes, so `_reregister_filters` (`hdf5plugin.register()`)
-       runs before it. `test_filters.py` asserts the exact pipeline incl.
-       flags; those cases are same-version so the resolver succeeds and the
+       runs before it. Same-version cases let the resolver succeed and the
        mandatory path is kept untouched — do not route them through verbatim.
 
 ## Testing
 
-    python make_eiger.py eiger
     python nxmx_reduce.py -n 12 eiger/lyso_1_master.h5 -o out --verify -v
-    python test_filters.py          # needs pip install hdf5plugin
-    ./test_dials.sh <real_master.h5>
 
 Cross-version check (catches item 2) — build a venv with an older HDF5 and
 read the output back:

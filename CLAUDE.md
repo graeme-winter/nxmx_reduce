@@ -134,15 +134,27 @@ needed, no recompression cost.
    a sub-window of each frame, which is not a whole chunk, so the compressed
    bytes cannot be reused; frames are decoded, sliced, and recompressed
    (gzip+shuffle). Things that bit us / to keep:
-     - **The module geometry is a hard-coded lookup, verified against real
-       data.** An Eiger image is a grid of `1028×512` (fast×slow) modules with
-       `12 px` (fast) / `38 px` (slow) inter-module gaps — these constants were
-       read off the gap pixels of a real Diamond I04 Eiger 16M, *not* the
-       nominal `1030×514`/`10`/`37` you'll find quoted; the data array uses
-       these. `identify_eiger` matches the `(slow, fast)` shape to a class
-       (16M=4×8, 9M=3×6, 4M=2×4, 1M=1×2, 500K=1×1) and `plan_crop` keeps the
-       centred block of whole modules, so the window always starts/ends on a
-       module boundary and only discards whole outer modules and their gaps.
+     - **The module geometry is a hard-coded lookup over two Eiger families,
+       keyed by image shape.** An Eiger image is a grid of modules separated by
+       fixed gaps, and there are two geometries in the wild — told apart
+       *unambiguously* by the image dimensions (no class in one family shares a
+       shape with any class in the other):
+         - **Eiger2** — `1028×512` (fast×slow) modules, `12 px` (fast) /
+           `38 px` (slow) gaps → 16M = `4148×4362`. These were read off the gap
+           pixels of a real Diamond I04 Eiger 16M (which, despite the
+           `description = "Eiger 16M"`, uses this data-array geometry) and are
+           verified end-to-end.
+         - **Eiger (gen 1)** — `1030×514` modules, `10 px` (fast, "vertical
+           join") / `37 px` (slow, "horizontal join") gaps → 16M = `4150×4371`.
+       `EIGER_FAMILIES` holds both; `identify_eiger` returns
+       `(family, class, grid)` for the matching `(slow, fast)` shape (classes
+       16M=4×8, 9M=3×6, 4M=2×4, 1M=1×2, 500K=1×1), and `plan_crop` keeps the
+       centred block of whole modules **using that family's pitch**, so the
+       window always starts/ends on a module boundary and only discards whole
+       outer modules and their gaps. Do not collapse the two families back to
+       one set of constants — the Eiger2 real-data numbers (1028/512/12/38) and
+       the Eiger1 nominal numbers (1030/514/10/37) are both correct, for
+       different detectors.
      - **The crop is only valid if the header moves with it.** Three things
        change and DIALS reads all of them: image size (`x/y_pixels_in_detector`,
        `module/data_size` — which is `[slow, fast]`), the beam centre
@@ -227,6 +239,13 @@ The 67 spots on the discarded outer modules are correctly gone.
 - Multi-module / multi-NXdata detectors (Jungfrau-style).
 - Masters where a VDS source selection does not start at frame 0 —
   handled in code, never exercised.
+- `--crop` on a **first-generation Eiger** (`1030×514`/`10`/`37`; e.g. 16M =
+  `4150×4371`): the geometry and crop windows are derived and unit-tested
+  (`plan_crop`/`identify_eiger`) but not yet run against a real Eiger1 file —
+  the only real data on hand is the Eiger2-geometry `ins10_1.nxs`.
+- `--crop` on layouts other than the self-ref-VDS-over-external-link one
+  (contiguous-master / plain-external-link stacks) — the code path is generic
+  but untested for cropping.
 
 ## Style
 

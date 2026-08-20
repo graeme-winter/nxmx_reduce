@@ -83,24 +83,31 @@ NIMAGE_SCALARS = ("nimages", "num_images", "number_of_images")
 # Eiger detector module geometry and centred cropping (--crop)
 # --------------------------------------------------------------------------
 #
-# An Eiger/Eiger2 image is a rectangular grid of identical sensor modules
-# separated by blank inter-module gaps.  The constants below are the
-# *data-array* dimensions, verified empirically against real DECTRIS data
-# (a Diamond I04 Eiger 16M, whose gap pixels give exactly this layout):
-# every module writes 1028 (fast) x 512 (slow) real pixels, and neighbouring
-# modules are separated by a 12 px (fast) / 38 px (slow) gap.  This lets us
-# work out where each module sits so a crop lands on module boundaries and
-# discards only whole outer modules and their adjacent gaps.
-EIGER_MODULE_FAST = 1028
-EIGER_MODULE_SLOW = 512
-EIGER_GAP_FAST = 12
-EIGER_GAP_SLOW = 38
+# An Eiger image is a rectangular grid of identical sensor modules separated by
+# blank inter-module gaps.  There are two module geometries in the wild, and
+# they are told apart *unambiguously* by the image dimensions (no class in one
+# family shares a shape with any class in the other):
+#
+#   * Eiger (first generation): module 1030 (fast) x 514 (slow) px, with a
+#     10 px (fast / "vertical join") / 37 px (slow / "horizontal join") gap.
+#     16M -> 4150 x 4371 (fast x slow).
+#   * Eiger2: module 1028 x 512 px, with a 12 px (fast) / 38 px (slow) gap.
+#     16M -> 4148 x 4362.  These constants were read straight off the gap
+#     pixels of a real Diamond I04 Eiger 16M and are verified end-to-end.
+#
+# Knowing the module pitch lets a crop land exactly on a module boundary, so it
+# only ever discards whole outer modules and their adjacent gaps.
+EIGER_FAMILIES = (
+    dict(name="Eiger2", module_fast=1028, module_slow=512,
+         gap_fast=12, gap_slow=38),
+    dict(name="Eiger", module_fast=1030, module_slow=514,
+         gap_fast=10, gap_slow=37),
+)
 
-# Named Eiger classes as (modules_fast, modules_slow) grids.  The data-array
-# pixel dimensions computed from these match real files exactly:
-#   16M -> 4148 x 4362,  9M -> 3108 x 3262,  4M -> 2068 x 2162,
-#    1M -> 1028 x 1062, 500K -> 1028 x 512   (fast x slow)
-EIGER_CONFIGS = {
+# Named Eiger classes as (modules_fast, modules_slow) grids (shared by both
+# families).  Applying a family's module/gap sizes gives its data-array shape,
+# e.g. Eiger2 16M -> 4148 x 4362, Eiger 16M -> 4150 x 4371 (fast x slow).
+EIGER_CLASS_GRID = {
     "500K": (1, 1),
     "1M": (1, 2),
     "4M": (2, 4),
@@ -109,76 +116,81 @@ EIGER_CONFIGS = {
 }
 
 # Default central crop target for each source class (as the user asked:
-# 16M -> 4M, 9M -> 1M).  A different target may be forced with --crop <name>.
+# 16M -> 4M, 9M -> 1M).  A different target may be forced with --crop-to.
 EIGER_DEFAULT_CROP = {"16M": "4M", "9M": "1M"}
 
 
-def _eiger_dims(grid):
-    """(fast, slow) data-array pixel dimensions of a (n_fast, n_slow) grid."""
+def _grid_dims(fam, grid):
+    """(fast, slow) data-array pixel dimensions of a grid in family ``fam``."""
     nf, ns = grid
-    fast = nf * EIGER_MODULE_FAST + (nf - 1) * EIGER_GAP_FAST
-    slow = ns * EIGER_MODULE_SLOW + (ns - 1) * EIGER_GAP_SLOW
+    fast = nf * fam["module_fast"] + (nf - 1) * fam["gap_fast"]
+    slow = ns * fam["module_slow"] + (ns - 1) * fam["gap_slow"]
     return fast, slow
 
 
 def identify_eiger(image_shape):
-    """Name the Eiger class whose data array is ``image_shape`` = (slow, fast).
+    """Identify the Eiger detector whose data array is ``image_shape`` = (slow,
+    fast).
 
-    Returns ``(name, grid)`` or ``(None, None)`` if no class matches.
+    Returns ``(family, class_name, grid)`` or ``(None, None, None)`` if no
+    class in any family matches.
     """
     slow, fast = int(image_shape[0]), int(image_shape[1])
-    for name, grid in EIGER_CONFIGS.items():
-        if _eiger_dims(grid) == (fast, slow):
-            return name, grid
-    return None, None
+    for fam in EIGER_FAMILIES:
+        for name, grid in EIGER_CLASS_GRID.items():
+            if _grid_dims(fam, grid) == (fast, slow):
+                return fam, name, grid
+    return None, None, None
 
 
 def plan_crop(image_shape, target=None):
     """Work out the centred pixel window to crop ``image_shape`` to ``target``.
 
     ``image_shape`` is (slow, fast).  ``target`` is an Eiger class name
-    (e.g. ``'4M'``) or ``None`` to use ``EIGER_DEFAULT_CROP``.  Returns
-    ``(sy0, sy1, sx0, sx1, info)`` -- the window is ``[sy0:sy1, sx0:sx1]`` on a
-    (slow, fast) frame and always begins/ends on a module boundary, so only
-    whole outer modules (and the gaps beside them) are discarded.  Raises
-    ``SystemExit`` if the source is not a recognised Eiger class or the target
-    does not fit inside it.
+    (e.g. ``'4M'``) or ``None`` to use ``EIGER_DEFAULT_CROP``.  The detector
+    family (module/gap geometry) is inferred from ``image_shape`` and the crop
+    stays within that family.  Returns ``(sy0, sy1, sx0, sx1, info)`` -- the
+    window is ``[sy0:sy1, sx0:sx1]`` on a (slow, fast) frame and always
+    begins/ends on a module boundary, so only whole outer modules (and the gaps
+    beside them) are discarded.  Raises ``SystemExit`` if the source is not a
+    recognised Eiger class or the target does not fit inside it.
     """
-    name, grid = identify_eiger(image_shape)
-    if name is None:
+    fam, name, grid = identify_eiger(image_shape)
+    if fam is None:
+        known = ", ".join(
+            f"{f['name']} {n} {_grid_dims(f, g)[0]}x{_grid_dims(f, g)[1]}"
+            for f in EIGER_FAMILIES for n, g in EIGER_CLASS_GRID.items())
         raise SystemExit(
             f"--crop: image shape (slow,fast)={tuple(image_shape)} is not a "
             "recognised Eiger module grid; cannot work out the module layout. "
-            f"Known classes: "
-            + ", ".join(f"{n} {_eiger_dims(g)[0]}x{_eiger_dims(g)[1]}"
-                        for n, g in EIGER_CONFIGS.items()))
+            f"Known (fast x slow): {known}")
     if target is None:
         target = EIGER_DEFAULT_CROP.get(name)
         if target is None:
             raise SystemExit(
-                f"--crop: no default crop target for an Eiger {name}; pass one "
-                f"explicitly, e.g. --crop 1M (choices: {', '.join(EIGER_CONFIGS)})")
+                f"--crop: no default crop target for an {fam['name']} {name}; "
+                f"pass one with --crop-to (choices: {', '.join(EIGER_CLASS_GRID)})")
     target = target.upper()
-    if target not in EIGER_CONFIGS:
+    if target not in EIGER_CLASS_GRID:
         raise SystemExit(
             f"--crop: unknown target {target!r}; choose one of "
-            f"{', '.join(EIGER_CONFIGS)}")
+            f"{', '.join(EIGER_CLASS_GRID)}")
     nf, ns = grid
-    tf, ts = EIGER_CONFIGS[target]
+    tf, ts = EIGER_CLASS_GRID[target]
     if tf > nf or ts > ns:
         raise SystemExit(
-            f"--crop: cannot crop an Eiger {name} ({nf}x{ns} modules) to "
-            f"{target} ({tf}x{ts} modules) -- the target is larger")
+            f"--crop: cannot crop an {fam['name']} {name} ({nf}x{ns} modules) "
+            f"to {target} ({tf}x{ts} modules) -- the target is larger")
     # centred block of whole modules
     f0, s0 = (nf - tf) // 2, (ns - ts) // 2
-    pitch_f = EIGER_MODULE_FAST + EIGER_GAP_FAST
-    pitch_s = EIGER_MODULE_SLOW + EIGER_GAP_SLOW
+    pitch_f = fam["module_fast"] + fam["gap_fast"]
+    pitch_s = fam["module_slow"] + fam["gap_slow"]
     sx0 = f0 * pitch_f
-    sx1 = sx0 + tf * EIGER_MODULE_FAST + (tf - 1) * EIGER_GAP_FAST
+    sx1 = sx0 + tf * fam["module_fast"] + (tf - 1) * fam["gap_fast"]
     sy0 = s0 * pitch_s
-    sy1 = sy0 + ts * EIGER_MODULE_SLOW + (ts - 1) * EIGER_GAP_SLOW
-    info = (f"{name} ({nf}x{ns}) -> {target} ({tf}x{ts}); keep modules "
-            f"fast[{f0}:{f0 + tf}] slow[{s0}:{s0 + ts}], "
+    sy1 = sy0 + ts * fam["module_slow"] + (ts - 1) * fam["gap_slow"]
+    info = (f"{fam['name']} {name} ({nf}x{ns}) -> {target} ({tf}x{ts}); keep "
+            f"modules fast[{f0}:{f0 + tf}] slow[{s0}:{s0 + ts}], "
             f"window slow[{sy0}:{sy1}] fast[{sx0}:{sx1}] "
             f"-> ({sy1 - sy0}, {sx1 - sx0})")
     return sy0, sy1, sx0, sx1, info
@@ -1636,10 +1648,10 @@ def main(argv=None):
                         "are decoded and recompressed, so a filter plugin must "
                         "be installed; cannot be combined with --frames-per-data")
     p.add_argument("--crop-to", metavar="CLASS", default=None,
-                   choices=tuple(EIGER_CONFIGS),
+                   choices=tuple(EIGER_CLASS_GRID),
                    help="crop to this Eiger class instead of the default "
                         "(implies --crop); choices: "
-                        + ", ".join(EIGER_CONFIGS))
+                        + ", ".join(EIGER_CLASS_GRID))
     p.add_argument("-l", "--compression-level", type=int, default=4,
                    choices=range(0, 10),
                    help="gzip level for recompressed masks (default: 4)")

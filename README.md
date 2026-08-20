@@ -171,11 +171,18 @@ By default the target class is chosen from the source: a **16M → 4M** and a
 nxmx-reduce -n 20 --crop-to 1M ins10_1.nxs -o small --verify
 ```
 
-An Eiger image is a grid of identical `1028×512` px modules separated by fixed
-`12`/`38` px gaps; the crop always starts and ends on a module boundary, so it
-only ever removes whole outer modules — no module is split. The header is
-rewritten to match so the copy is geometrically correct in DIALS and other
-NXmx readers:
+An Eiger image is a grid of identical modules separated by fixed gaps. Two
+module geometries are supported, and the right one is picked automatically from
+the image dimensions (they never collide):
+
+| Family | Module (fast×slow) | Gaps (fast/slow) | 16M size (fast×slow) |
+|---|---|---|---|
+| Eiger (gen 1) | 1030×514 | 10 / 37 | 4150×4371 |
+| Eiger2 | 1028×512 | 12 / 38 | 4148×4362 |
+
+The crop always starts and ends on a module boundary, so it only ever removes
+whole outer modules — no module is split. The header is rewritten to match so
+the copy is geometrically correct in DIALS and other NXmx readers:
 
 - the image size (`x/y_pixels_in_detector`, `module/data_size`);
 - the beam centre (`beam_center_x/y`), shifted by the pixels removed from the

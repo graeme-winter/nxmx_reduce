@@ -4,6 +4,10 @@ Tool that shrinks an NXmx data set: recompresses masks, truncates the image
 stack to `-n` frames, and truncates every per-image data set to match.
 Written for NE-CAT (APS 24-ID-C / 24-ID-E) Eiger2 data.
 
+`--frames-per-data N` additionally *repartitions* the kept stack into output
+data files of at most `N` frames each and rebuilds the virtual data set (and
+the `data_00000i` links) to match — see item 7 below.
+
 ## Layout
 
     nxmx_reduce.py    the tool
@@ -90,9 +94,51 @@ needed, no recompression cost.
        runs before it. Same-version cases let the resolver succeed and the
        mandatory path is kept untouched — do not route them through verbatim.
 
+7. **`--frames-per-data N` repartitions the stack — the output data files are
+   decoupled from the source ones.** `_write_out_data_files` materialises the
+   kept `nout` frames into fresh files of `N` frames each *before* the master
+   walk, and `write_repartition_vds` (intercepted at the top of `copy_dataset`,
+   before the `is_virtual`/`keeps` branches) rebuilds `entry/data/data` as a
+   self-ref VDS over regenerated `data_00000i` external links. Source image
+   files are "absorbed": their links are dropped in `visit` (matched against
+   `absorbed_paths`) and they are never enqueued. Things that bit us / to keep:
+     - **Only the DECTRIS self-ref-VDS-over-external-link layout is supported**
+       (`plan.repartitionable`, set in `_scan_nxdata` when `resolve_extlink`
+       fires). `_plan_repartition` rejects other layouts, multi-NXdata, mixed
+       source dtype/shape/chunks/pipeline, and `chunks[0] != 1` — the verbatim
+       per-frame copy (`_copy_one_frame`) needs one chunk per frame, and decode
+       is unavailable anyway once preflight has unregistered the filter (item 6).
+     - **A block may straddle a source boundary** (e.g. `-n 1500
+       --frames-per-data 400` puts src1[800:1000]+src2[0:200] in one file).
+       `frame_map[v] = (source, source_frame_index)` drives this; the uniform-
+       pipeline precondition guarantees every source's chunks are byte-writable
+       into the one output dataset.
+     - **Naming continues the *source* pattern**, so filenames stay
+       `ins10_1_00000i.h5` (retain original names). `_split_numbered` must strip
+       the extension first — otherwise the `5` in `.h5` is taken as the counter
+       and files come out `ins10_1_000004.h1`. `--verify` does *not* catch this
+       (the VDS/links/files stay internally consistent); only inspecting the
+       written filenames does.
+     - VirtualSource shape is the block's real length (last block is the
+       remainder), per item 3. `create_like`/`_create_verbatim` and the item-1
+       assert are shared via `_create_image_like`. New files get `self.libver`
+       (item 2). `verify` skips absorbed sources and relies on the master-stack
+       readback (which decodes through the rebuilt VDS → links → new files).
+
 ## Testing
 
     python nxmx_reduce.py -n 12 eiger/lyso_1_master.h5 -o out --verify -v
+
+Repartition (item 7) — verify covers divisible, remainder, and a block that
+straddles a source boundary:
+
+    python nxmx_reduce.py -n 600  --frames-per-data 100 ins10_1.nxs -o out --verify
+    python nxmx_reduce.py -n 250  --frames-per-data 100 ins10_1.nxs -o out --verify  # 100,100,50
+    python nxmx_reduce.py -n 1500 --frames-per-data 400 ins10_1.nxs -o out --verify  # block 3 crosses src edge
+
+After repartitioning, *check the written filenames* (`ins10_1_00000i.h5`) and
+the regenerated `data_00000i` links — `--verify` alone will not catch a naming
+bug.
 
 Cross-version check (catches item 2) — build a venv with an older HDF5 and
 read the output back:
@@ -114,6 +160,13 @@ reflections with zero per-frame mismatches and byte-identical centroids —
 i.e. matches `dials.import image_range=1,600` on the original exactly. The
 compressed chunks are now copied **verbatim** (see non-obvious item 6), not
 decoded/recompressed: ~2 s for the copy and byte-identical to the source.
+
+`--frames-per-data` verified end-to-end too: on `ins10_1.nxs` `-n 20
+--frames-per-data 7` (original 4 files → 3 files of 7/7/6), `dials.import`
+geometry is identical to the original and `dials.find_spots` gives 1046 ==
+1046 reflections vs `image_range=1,20` on the original; a block that crosses a
+source boundary (`-n 1500 --frames-per-data 400`) is byte-identical at the seam
+(src1[999]==file3[199], src2[0]==file3[200]).
 
 ## Not yet verified
 

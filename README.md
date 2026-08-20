@@ -29,6 +29,11 @@ Given a master file and `-n N`, it writes into an output directory:
    cut to `N`, and book-keeping scalars like `nimages`/`image_nr_high` are
    patched to match.
 
+Optionally, `--frames-per-data N` **repartitions** the kept stack into output
+data files of at most `N` frames each (instead of mirroring the source's
+partitioning), rebuilding the virtual data set and the `data_00000i` links to
+match. See [Repartitioning](#repartitioning-the-data-files) below.
+
 ## Requirements
 
 - Python 3.9+
@@ -90,6 +95,7 @@ dials.import small/ins10_1.nxs
 |---|---|
 | `-n, --num-images N` | **(required)** number of images to keep, from the start of the scan |
 | `-o, --output DIR` | output directory (default: `./reduced`) |
+| `--frames-per-data N` | repartition the kept images into data files of at most `N` frames each, rebuilding the VDS and `data_00000i` links (DECTRIS self-referencing-VDS layout) |
 | `--verify` | after writing, read every retained frame back and compare it with the original (needs a compression filter plugin, i.e. `hdf5plugin`) |
 | `-l, --compression-level 0–9` | gzip level for recompressed masks (default: 4) |
 | `--also-compress GLOB` | also gzip an extra data set by name, e.g. `--also-compress flatfield` (repeatable) |
@@ -115,6 +121,31 @@ verifying ...
 How much smaller depends on the data: for sparse frames the drop is dramatic;
 for dense, already well-compressed diffraction data the per-frame size is
 essentially fixed, so the reduction is roughly proportional to `N / total`.
+
+## Repartitioning the data files
+
+By default the output keeps the source's own image-file partitioning (one
+trimmed data file per source data file). With `--frames-per-data N` the kept
+stack is instead re-sliced into files of at most `N` frames each:
+
+```
+nxmx-reduce -n 600 --frames-per-data 100 ins10_1.nxs -o small --verify
+```
+
+This writes six data files of 100 frames — `ins10_1_000001.h5 …
+ins10_1_000006.h5`, continuing your data set's own naming — plus a master whose
+`entry/data/data` is a self-referencing VDS over regenerated `data_00000i`
+links, i.e. byte-structurally the same shape as a native DECTRIS master, just
+repartitioned. When the counts line up the filenames are identical to the
+originals.
+
+`N` can be larger than the number of kept frames (everything lands in one file)
+or as small as `1` (one frame per file). A block may span two source files —
+they are stitched seamlessly.
+
+It currently supports the DECTRIS self-referencing-VDS-over-external-link
+layout (the usual NE-CAT Eiger2 shape). Other layouts are rejected with a clear
+message; omit the flag to reduce them with their partitioning preserved.
 
 ## Notes and caveats
 

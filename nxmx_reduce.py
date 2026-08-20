@@ -40,6 +40,9 @@ Examples
 
     # keep 5 images and drop the flatfield correction entirely
     nxmx_reduce.py -n 5 master.nxs -o small --drop flatfield
+
+    # keep 600 images, repartitioned into data files of 100 frames each
+    nxmx_reduce.py -n 600 --frames-per-data 100 master.nxs -o small
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -61,7 +65,7 @@ except ImportError:
 
 import h5py
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 # Data set base names treated as masks (recompressed rather than copied).
 DEFAULT_MASK_NAMES = ("pixel_mask", "mask", "*_mask")
@@ -82,6 +86,27 @@ def human(nbytes: float) -> str:
             return f"{nbytes:.1f} {unit}" if unit != "B" else f"{nbytes:.0f} B"
         nbytes /= 1024.0
     return f"{nbytes:.1f} TB"
+
+
+def _split_numbered(name: str):
+    """Split a name around its last run of digits.
+
+    ``'data_000001'``        -> ``('data_', 6, '')``
+    ``'ins10_1_000001.h5'``  -> ``('ins10_1_', 6, '.h5')``
+
+    so ``f"{pre}{i:0{width}d}{suf}"`` regenerates the sequence.  Numbers
+    inside the stem (``ins10_1``) are left alone -- only the final digit run,
+    which is the per-file index, is treated as the counter.
+    """
+    # strip the extension first so a digit in it (the '5' of '.h5') is not
+    # mistaken for the counter
+    stem, ext = os.path.splitext(name)
+    m = re.search(r"(\d+)(\D*)$", stem)
+    if not m:
+        # no trailing number to continue; fall back to a plain suffix counter
+        return (stem + "_", 6, ext)
+    prefix = stem[:m.start(1)]
+    return (prefix, len(m.group(1)), m.group(2) + ext)
 
 
 def copy_attrs(src, dst) -> None:
@@ -238,7 +263,8 @@ def create_like(parent: h5py.Group, name: str, src: h5py.Dataset, shape,
 class ImageSource:
     """One file+path holding part of the image stack."""
 
-    __slots__ = ("path", "dset", "length", "keep", "vstart", "sstart")
+    __slots__ = ("path", "dset", "length", "keep", "vstart", "sstart",
+                 "rvstart", "rused")
 
     def __init__(self, path: Path, dset: str, length: int):
         self.path = path
@@ -247,6 +273,8 @@ class ImageSource:
         self.keep = 0
         self.vstart = None      # offset in the virtual (stitched) stack
         self.sstart = 0         # first frame used from this source
+        self.rvstart = 0        # resolved virtual start (filled by Plan.apply)
+        self.rused = 0          # resolved number of frames used (Plan.apply)
 
     @property
     def key(self):
@@ -340,6 +368,15 @@ class Plan:
         self.stack_paths: set[str] = set()   # paths of image stacks in master
         self.nimages = 0
         self.image_shape = None
+        # repartition template: filled when a self-ref-VDS-over-external-link
+        # stack is found (the DECTRIS filewriter layout).  Lets --frames-per-data
+        # regenerate the same structure with a different number of data files.
+        self.repartitionable = False
+        self.stack_vds_path = None       # master path of the image VDS
+        self.nxdata_group_path = None    # group holding it, e.g. /entry/data
+        self.data_internal_path = None   # dataset path inside each data file
+        self.link_name_example = None    # e.g. 'data_000001'
+        self.file_name_example = None    # e.g. 'ins10_1_000001.h5'
         self._build()
 
     def _add(self, path: Path, dset: str, length):
@@ -396,6 +433,14 @@ class Plan:
                         # double-counted with the direct external-link scan
                         real_path, real_dpath = resolve_extlink(fh, dpath, here)
                         if real_path is not None:
+                            # this is the layout --frames-per-data can rebuild:
+                            # remember how to regenerate the link/file/VDS names
+                            self.repartitionable = True
+                            self.stack_vds_path = obj.name
+                            self.nxdata_group_path = grp.name
+                            self.data_internal_path = real_dpath
+                            self.link_name_example = dpath.rsplit("/", 1)[-1]
+                            self.file_name_example = real_path.name
                             tgt, dpath = real_path, real_dpath
                     vstart, vlen = span_of(vmap.vspace)
                     sstart, slen = span_of(vmap.src_space)
@@ -445,7 +490,14 @@ class Plan:
                 vstart = running
             used = max(0, min(src.length - sstart, nout - vstart))
             src.keep = max(src.keep, min(src.length, sstart + used))
+            src.rvstart = vstart     # resolved position in the output stack
+            src.rused = used         # frames this source contributes
             running = vstart + (src.length - sstart)
+
+    def segments(self):
+        """Sources contributing at least one frame, in output-stack order."""
+        segs = [s for s in self.sources.values() if s.rused > 0]
+        return sorted(segs, key=lambda s: s.rvstart)
 
     def for_file(self, path: Path):
         return {k[1]: v for k, v in self.sources.items() if k[0] == str(path)}
@@ -482,6 +534,86 @@ class Reducer:
         # _preflight_pipelines); re-registered before --verify
         self.verbatim_filters: set[int] = set()
 
+        # -- repartition (--frames-per-data) ---------------------------
+        self.repartition = args.frames_per_data
+        self.absorbed_paths: set[Path] = set()
+        self.repart_files: list[tuple] = []      # (lo, hi, filename, linkname)
+        self.reserved_names: set[str] = set()    # output basenames not to reuse
+        if self.repartition:
+            self._plan_repartition()
+
+    # -- repartition planning ------------------------------------------
+    def _plan_repartition(self):
+        """Validate the layout and lay out the new data files/links."""
+        if self.repartition < 1:
+            raise SystemExit("--frames-per-data must be at least 1")
+        if not self.plan.repartitionable:
+            raise SystemExit(
+                "--frames-per-data currently supports the DECTRIS "
+                "self-referencing-VDS-over-external-link layout (master VDS "
+                "'entry/data/data' -> 'data_00000N' external links -> data "
+                "files); this data set does not use it, so its image "
+                "partitioning cannot be rebuilt.  Omit --frames-per-data to "
+                "reduce it with the source partitioning preserved.")
+        if len(self.plan.stack_paths) != 1:
+            raise SystemExit(
+                "--frames-per-data supports a single image stack; this data "
+                f"set has {len(self.plan.stack_paths)}.")
+        segs = self.plan.segments()
+        if not segs:
+            raise SystemExit("--frames-per-data: no image frames to repartition")
+        # every source feeding the stack must share one geometry + pipeline so
+        # a single output data set can hold any frame and take its compressed
+        # chunks verbatim (write_direct_chunk stores raw bytes against the
+        # destination's own recipe -- a mismatched source would be undecodable)
+        ref = None
+        with_open = {}
+        try:
+            for s in segs:
+                fh = with_open.get(str(s.path))
+                if fh is None:
+                    fh = with_open[str(s.path)] = h5py.File(s.path, "r")
+                d = fh[s.dset]
+                spec = (d.dtype.str, tuple(d.shape[1:]), tuple(d.chunks or ()),
+                        filters_of(d.id.get_create_plist()))
+                if ref is None:
+                    ref = spec
+                elif spec != ref:
+                    raise SystemExit(
+                        "--frames-per-data: image sources differ in "
+                        "dtype/shape/chunks/compression; cannot repartition "
+                        "into a single uniform data set.")
+            if not ref[2] or ref[2][0] != 1:
+                raise SystemExit(
+                    "--frames-per-data currently requires image data chunked "
+                    "one frame per chunk (chunks[0] == 1); this data set is "
+                    f"chunked {ref[2]}.")
+        finally:
+            for fh in with_open.values():
+                fh.close()
+
+        # continue the source's own naming so filenames stay e.g.
+        # ins10_1_00000i.h5 with data_00000i links (identical to the originals
+        # when the frame counts line up)
+        file_pre, file_w, file_suf = _split_numbered(self.plan.file_name_example)
+        link_pre, link_w, link_suf = _split_numbered(self.plan.link_name_example)
+        reserved = {self.outname_for(self.master)}
+        K = self.repartition
+        for i, lo in enumerate(range(0, self.nout, K), start=1):
+            hi = min(lo + K, self.nout)
+            fname = f"{file_pre}{i:0{file_w}d}{file_suf}"
+            lname = f"{link_pre}{i:0{link_w}d}{link_suf}"
+            if fname in reserved:
+                raise SystemExit(
+                    f"--frames-per-data: generated data-file name {fname!r} "
+                    "collides with another output file")
+            reserved.add(fname)
+            self.repart_files.append((lo, hi, fname, lname))
+        # keep the walk's outname_for from later handing a copied file one of
+        # these names and overwriting a data file we already wrote
+        self.reserved_names = {f for (_, _, f, _) in self.repart_files}
+        self.absorbed_paths = {s.path for s in self.plan.sources.values()}
+
     # -- naming --------------------------------------------------------
     def outname_for(self, path: Path) -> str:
         key = str(path)
@@ -490,7 +622,7 @@ class Reducer:
         base = path.name
         stem, ext = os.path.splitext(base)
         n = 1
-        while base in self.outnames.values():
+        while base in self.outnames.values() or base in self.reserved_names:
             base = f"{stem}_{n}{ext}"
             n += 1
         self.outnames[key] = base
@@ -527,6 +659,8 @@ class Reducer:
             raise SystemExit("refusing to write output into the input "
                              "directory -- choose a different -o")
         self._preflight_pipelines()
+        if self.repartition:
+            self._write_out_data_files()
         self.enqueue(self.master)
         while self.queue:
             src_path = self.queue.pop(0)
@@ -641,6 +775,13 @@ class Reducer:
                 if not tgt.is_absolute():
                     tgt = srcdir / tgt
                 tgt = tgt.resolve()
+                if self.repartition and tgt in self.absorbed_paths:
+                    # this image source is being repartitioned; its link is
+                    # regenerated (renumbered) in write_repartition_vds
+                    if self.args.verbose:
+                        print(f"  - repartition: dropping source link {name} "
+                              f"(-> {tgt.name})")
+                    continue
                 if self.plan.file_is_empty(tgt):
                     if self.args.verbose:
                         print(f"  - dropping link {name} "
@@ -665,6 +806,13 @@ class Reducer:
 
     # -- data set dispatch ---------------------------------------------
     def copy_dataset(self, name, src, dgrp, srcdir, keeps):
+        if (self.repartition and src.name == self.plan.stack_vds_path
+                and self._in_master(src)):
+            # rebuild the image stack over the new data files (intercept
+            # before the is_virtual / keeps branches below)
+            self.write_repartition_vds(name, src, dgrp)
+            return
+
         if is_virtual(src):
             self.copy_virtual(name, src, dgrp, srcdir)
             return
@@ -782,10 +930,16 @@ class Reducer:
             return None
         return dst
 
-    def copy_frames(self, name, src, dgrp, keep, label=""):
-        """Copy the leading `keep` planes of `src`, chunk-wise if possible."""
-        keep = max(0, min(keep, src.shape[0] if src.ndim else 0))
-        shape = (keep,) + tuple(src.shape[1:])
+    def _create_image_like(self, dgrp, name, src, shape):
+        """Create an image data set matching `src`'s dtype/chunks/pipeline.
+
+        Returns ``(dst, mode)`` where mode is one of ``'raw'`` (exact pipeline
+        reproduced -- copy chunks verbatim), ``'verbatim'`` (source cd_values
+        stored, filter optional -- copy chunks verbatim), ``'recompress'``
+        (gzip fallback -- caller must decode) or ``'plain'`` (uncompressed).
+        Shared by ``copy_frames`` and the repartition writer so the create
+        ladder -- and the item-1 pipeline assert -- lives in one place.
+        """
         filters = self.pipelines.resolve(src) if src.chunks else None
         if src.chunks and filters is not None:
             # exact pipeline reproducible -- recreate it and copy chunks raw
@@ -797,36 +951,189 @@ class Reducer:
                     f"internal error: filter pipeline for {src.name} came out "
                     f"as {got}, expected {want}; refusing to write a data set "
                     "that would not decompress")
-            self._copy_chunks(src, dst, keep)
-        elif src.chunks:
+            return dst, "raw"
+        if src.chunks:
             # exact recipe not reproducible (e.g. the local filter plugin is
             # a different version) -- still copy the compressed chunks
             # verbatim, storing the source's cd_values with the filter marked
             # optional.  No decode, no recompress, no plugin needed.
             dst = self._create_verbatim(name, src, dgrp, shape)
             if dst is not None:
-                if self.args.verbose:
-                    print(f"  . {src.name}: {keep} compressed frame(s) copied "
-                          "verbatim (filter marked optional)")
-                self._copy_chunks(src, dst, keep)
-            else:
-                # last resort: decode + recompress (needs the filter plugin)
-                print(f"  ! {src.name}: cannot reproduce filter pipeline "
-                      "exactly and verbatim copy failed; falling back to "
-                      "decode + recompress (needs the filter plugin, e.g. "
-                      "pip install hdf5plugin)", file=sys.stderr)
-                dst = dgrp.create_dataset(
-                    name, shape=shape, dtype=src.dtype, chunks=src.chunks,
-                    compression="gzip", compression_opts=1, shuffle=True)
-                for i in range(0, keep, max(1, src.chunks[0])):
-                    j = min(i + max(1, src.chunks[0]), keep)
-                    dst[i:j] = src[i:j]
-        else:
-            dst = dgrp.create_dataset(name, shape=shape, dtype=src.dtype)
+                return dst, "verbatim"
+            # last resort: decode + recompress (needs the filter plugin)
+            print(f"  ! {src.name}: cannot reproduce filter pipeline "
+                  "exactly and verbatim copy failed; falling back to "
+                  "decode + recompress (needs the filter plugin, e.g. "
+                  "pip install hdf5plugin)", file=sys.stderr)
+            dst = dgrp.create_dataset(
+                name, shape=shape, dtype=src.dtype, chunks=src.chunks,
+                compression="gzip", compression_opts=1, shuffle=True)
+            return dst, "recompress"
+        return dgrp.create_dataset(name, shape=shape, dtype=src.dtype), "plain"
+
+    def copy_frames(self, name, src, dgrp, keep, label=""):
+        """Copy the leading `keep` planes of `src`, chunk-wise if possible."""
+        keep = max(0, min(keep, src.shape[0] if src.ndim else 0))
+        shape = (keep,) + tuple(src.shape[1:])
+        dst, mode = self._create_image_like(dgrp, name, src, shape)
+        if mode in ("raw", "verbatim"):
+            if mode == "verbatim" and self.args.verbose:
+                print(f"  . {src.name}: {keep} compressed frame(s) copied "
+                      "verbatim (filter marked optional)")
+            self._copy_chunks(src, dst, keep)
+        elif mode == "recompress":
+            for i in range(0, keep, max(1, src.chunks[0])):
+                j = min(i + max(1, src.chunks[0]), keep)
+                dst[i:j] = src[i:j]
+        else:  # plain
             if keep:
                 dst[...] = src[:keep]
         copy_attrs(src, dst)
         self.fixup(name, src, dst, dgrp)
+
+    # -- repartition (--frames-per-data) -------------------------------
+    def _in_master(self, dset) -> bool:
+        try:
+            return Path(dset.file.filename).resolve() == self.master
+        except Exception:
+            return False
+
+    def _copy_one_frame(self, sd, s_index, dd, d_index, mode):
+        """Copy one image plane ``sd[s_index]`` -> ``dd[d_index]``."""
+        if mode in ("raw", "verbatim"):
+            # chunks[0] == 1 (enforced), so a frame is a whole number of
+            # chunks; remap only the slow index and move the bytes raw
+            base = (1,) + tuple(sd.shape[1:])
+            for off in iter_chunk_offsets(base, sd.chunks, 1):
+                s_off = (s_index,) + off[1:]
+                d_off = (d_index,) + off[1:]
+                try:
+                    mask, raw = sd.id.read_direct_chunk(s_off)
+                    dd.id.write_direct_chunk(d_off, raw, mask)
+                except OSError:
+                    pass                 # unallocated chunk -> leave fill value
+        else:                            # recompress / plain -- decode + write
+            dd[d_index] = sd[s_index]
+
+    def _stamp_image_range(self, dst, lo):
+        """If the template carried per-file image_nr_low/high, set them to the
+        absolute scan range this block now covers (1-based)."""
+        kept = dst.shape[0] if getattr(dst, "ndim", 0) else 0
+        if "image_nr_low" in dst.attrs:
+            try:
+                dst.attrs.modify("image_nr_low", lo + 1)
+            except Exception:
+                pass
+        if "image_nr_high" in dst.attrs:
+            try:
+                dst.attrs.modify("image_nr_high", lo + kept)
+            except Exception:
+                pass
+
+    def _write_out_data_files(self):
+        """Materialise the repartitioned image stack into new data files.
+
+        Runs after ``_preflight_pipelines`` (so the verbatim path is armed)
+        and before the master walk (so the rebuilt VDS references files that
+        already exist).  Each output file holds up to ``--frames-per-data``
+        frames, drawn -- possibly across a source boundary -- from the
+        retained stack; compressed chunks are copied verbatim.
+        """
+        segs = self.plan.segments()
+        # output-stack frame v  <-  (source, source frame index)
+        frame_map = [None] * self.nout
+        for s in segs:
+            for i in range(s.rused):
+                v = s.rvstart + i
+                if 0 <= v < self.nout:
+                    frame_map[v] = (s, s.sstart + i)
+
+        handles: dict[str, h5py.File] = {}
+
+        def sdset(s):
+            fh = handles.get(str(s.path))
+            if fh is None:
+                fh = handles[str(s.path)] = h5py.File(s.path, "r")
+            return fh[s.dset]
+
+        # warn if an absorbed data file carries data sets other than the image
+        # one (they are dropped when the file is repartitioned away)
+        for s in segs:
+            others: list[str] = []
+
+            def _note(_n, obj, _keep=s.dset):
+                if isinstance(obj, h5py.Dataset) and obj.name != _keep:
+                    others.append(obj.name)
+
+            try:
+                sdset(s).file.visititems(_note)
+            except Exception:
+                pass                     # broken link etc. -- warning is advisory
+            if others:
+                print(f"  ! {s.path.name}: repartition keeps only {s.dset}; "
+                      f"other data set(s) {others} are not carried over",
+                      file=sys.stderr)
+
+        dname = self.plan.data_internal_path.lstrip("/")   # 'data' or 'a/b/data'
+        template = sdset(segs[0])
+        try:
+            for (lo, hi, fname, _lname) in self.repart_files:
+                shape = (hi - lo,) + tuple(self.plan.image_shape)
+                with h5py.File(self.outdir / fname, "w",
+                               libver=self.libver) as fout:
+                    if "/" in dname:
+                        parent = fout.require_group(dname.rsplit("/", 1)[0])
+                        leaf = dname.rsplit("/", 1)[1]
+                    else:
+                        parent, leaf = fout, dname
+                    dst, mode = self._create_image_like(
+                        parent, leaf, template, shape)
+                    for v in range(lo, hi):
+                        entry = frame_map[v]
+                        if entry is None:        # gap -- leave at fill value
+                            continue
+                        s, si = entry
+                        self._copy_one_frame(sdset(s), si, dst, v - lo, mode)
+                    copy_attrs(template, dst)
+                    self._stamp_image_range(dst, lo)
+                self.stats["frames"] += (hi - lo)
+                self.stats["files"] += 1
+        finally:
+            for fh in handles.values():
+                fh.close()
+        if self.args.verbose:
+            print(f"  . repartitioned {self.nout} frame(s) into "
+                  f"{len(self.repart_files)} file(s) of up to "
+                  f"{self.repartition}")
+
+    def write_repartition_vds(self, name, src, dgrp):
+        """Rebuild the master's image VDS over the repartitioned data files.
+
+        Preserves the DECTRIS structure: regenerate the ``data_00000i``
+        external links in this NXdata group and a self-referencing VDS over
+        them (source file ``'.'``), exactly as the source master carried --
+        just with however many files the new partitioning needs.
+        """
+        img_shape = tuple(src.shape[1:])
+        shape = (self.nout,) + img_shape
+        dpath = self.plan.data_internal_path
+        for (lo, hi, fname, lname) in self.repart_files:
+            if lname in dgrp:                    # defensive: never double up
+                del dgrp[lname]
+            dgrp[lname] = h5py.ExternalLink(fname, dpath)
+        layout = h5py.VirtualLayout(shape=shape, dtype=src.dtype)
+        for (lo, hi, fname, lname) in self.repart_files:
+            count = hi - lo                      # exact per-block length (item 3)
+            vsrc = h5py.VirtualSource(
+                ".", f"{self.plan.nxdata_group_path}/{lname}",
+                shape=(count,) + img_shape, dtype=src.dtype)
+            layout[lo:hi] = vsrc[0:count]
+        dst = dgrp.create_virtual_dataset(name, layout, fillvalue=src.fillvalue)
+        copy_attrs(src, dst)
+        self.fixup(name, src, dst, dgrp)
+        if self.args.verbose:
+            print(f"  . rebuilt VDS {src.name}: {src.shape} -> {shape} "
+                  f"across {len(self.repart_files)} data file(s)")
 
     def compress_dataset(self, name, src, dgrp):
         level = self.args.compression_level
@@ -903,6 +1210,10 @@ class Reducer:
         for src in self.plan.sources.values():
             if src.keep == 0 or src.path == self.master:
                 continue
+            if src.path in self.absorbed_paths:
+                # repartitioned: there is no 1:1 output file; the whole stack
+                # is validated by the master-stack readback below
+                continue
             dst = self.outdir / self.outname_for(src.path)
             try:
                 with h5py.File(src.path, "r") as a, h5py.File(dst, "r") as b:
@@ -944,6 +1255,7 @@ class Reducer:
         src_files = {Path(p) for p in self.done}
         src_files |= {s.path for s in self.plan.sources.values()}
         out_files = [self.outdir / n for n in self.outnames.values()]
+        out_files += [self.outdir / f for (_, _, f, _) in self.repart_files]
         before, after = tree_size(src_files), tree_size(out_files)
         print(f"\nimages    : {self.nin} -> {self.nout}")
         print(f"files     : {len(src_files)} in data set, "
@@ -951,6 +1263,9 @@ class Reducer:
         print(f"masks     : {self.stats['masks']} recompressed")
         if self.stats["dropped"]:
             print(f"dropped   : {self.stats['dropped']} data set(s) removed")
+        if self.repart_files:
+            print(f"repart    : image stack -> {len(self.repart_files)} data "
+                  f"file(s) of up to {self.repartition} frame(s)")
         print(f"per-image : {self.stats['trimmed']} data set(s) truncated")
         print(f"size      : {human(before)} -> {human(after)}"
               + (f"  ({before / after:.1f}x smaller)" if after else ""))
@@ -972,6 +1287,12 @@ def main(argv=None):
                    help="number of images to keep (from the start of the scan)")
     p.add_argument("-o", "--output", default="reduced",
                    help="output directory (default: ./reduced)")
+    p.add_argument("--frames-per-data", type=int, default=None, metavar="N",
+                   help="repartition the kept images into data files of at "
+                        "most N frames each, rebuilding the virtual data set "
+                        "(and the data_00000i links) to match; output files "
+                        "continue the source's naming (e.g. ins10_1_00000i.h5). "
+                        "Supports the DECTRIS self-referencing-VDS layout")
     p.add_argument("-l", "--compression-level", type=int, default=4,
                    choices=range(0, 10),
                    help="gzip level for recompressed masks (default: 4)")
@@ -1001,6 +1322,8 @@ def main(argv=None):
 
     if args.num_images < 1:
         p.error("-n must be at least 1")
+    if args.frames_per_data is not None and args.frames_per_data < 1:
+        p.error("--frames-per-data must be at least 1")
     if not Path(args.master).exists():
         p.error(f"no such file: {args.master}")
 
